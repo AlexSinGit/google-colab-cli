@@ -37,7 +37,6 @@ the ``X-Colab-Ssh-Pubkey`` header. RSA keys are rejected by the server, so
 import contextlib
 import os
 from pathlib import Path
-import select
 import shlex
 import signal
 import subprocess
@@ -360,9 +359,6 @@ def _bridge_proxy_mode(ws: websocket.WebSocket) -> int:
     def stdin_to_ws():
         try:
             while True:
-                ready, _, _ = select.select([stdin_fd], [], [], None)
-                if not ready:
-                    continue
                 data = os.read(stdin_fd, 8192)
                 if not data:
                     break
