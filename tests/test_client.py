@@ -12,16 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import uuid
 import json
-import pytest
+import uuid
 from unittest.mock import MagicMock
+
+import pytest
+import requests
+
 from colab_cli.client import (
-    Client,
-    Prod,
-    PostAssignmentResponse,
-    Assignment,
     Accelerator,
+    Assignment,
+    Client,
+    ColabRequestError,
+    GetAssignmentResponse,
+    PostAssignmentResponse,
+    Prod,
     Shape,
     TooManyAssignmentsError,
     Variant,
@@ -37,6 +42,158 @@ def mock_session():
 @pytest.fixture
 def client(mock_session):
     return Client(Prod(), mock_session)
+
+
+def test_request_timeout_override_and_explicit_precedence(
+    client, mock_session, monkeypatch
+):
+    monkeypatch.setenv("COLAB_CLI_REQUEST_TIMEOUT", "300")
+    mock_session.request.return_value.text = ""
+    client._issue_request("https://colab.research.google.com/test")
+    assert mock_session.request.call_args.kwargs["timeout"] == 300
+    client._issue_request("https://colab.research.google.com/test", timeout=12)
+    assert mock_session.request.call_args.kwargs["timeout"] == 12
+
+
+def test_request_default_timeout_is_preserved(client, mock_session, monkeypatch):
+    monkeypatch.delenv("COLAB_CLI_REQUEST_TIMEOUT", raising=False)
+    mock_session.request.return_value.text = ""
+    client._issue_request("https://colab.research.google.com/test")
+    assert "timeout" not in mock_session.request.call_args.kwargs
+
+
+def pending_assignment(token="initial"):
+    return GetAssignmentResponse(acc="NONE", nbh="same", token=token, variant="DEFAULT")
+
+
+def allocated_assignment():
+    return Assignment(
+        endpoint="recovered",
+        runtimeProxyInfo={
+            "token": "proxy",
+            "tokenExpiresInSeconds": 3600,
+            "url": "http://backend",
+        },
+    )
+
+
+@pytest.mark.parametrize("status", [None, 502, 503, 504])
+def test_assign_recovers_before_another_post(client, mocker, monkeypatch, status):
+    monkeypatch.setenv("COLAB_CLI_ASSIGN_RETRIES", "3")
+    monkeypatch.setenv("COLAB_CLI_RETRY_BACKOFF", "10")
+    recovered = allocated_assignment()
+    get = mocker.patch.object(
+        client, "_get_assignment", side_effect=[pending_assignment(), recovered]
+    )
+    error = (
+        requests.exceptions.ReadTimeout("allocation pending")
+        if status is None
+        else ColabRequestError(
+            "transient", request=None, response=MagicMock(status_code=status)
+        )
+    )
+    post = mocker.patch.object(client, "_post_assignment", side_effect=error)
+    sleep = mocker.patch("time.sleep")
+    notebook = uuid.uuid4()
+    assert client.assign(notebook) is recovered
+    assert get.call_count == 2
+    assert all(call.args[0] == notebook for call in get.call_args_list)
+    post.assert_called_once()
+    sleep.assert_called_once_with(10)
+
+
+def test_assign_refreshes_token_and_uses_bounded_backoff(client, mocker, monkeypatch):
+    monkeypatch.setenv("COLAB_CLI_ASSIGN_RETRIES", "3")
+    monkeypatch.setenv("COLAB_CLI_RETRY_BACKOFF", "10")
+    mocker.patch.object(
+        client,
+        "_get_assignment",
+        side_effect=[pending_assignment(str(i)) for i in range(4)],
+    )
+    post = mocker.patch.object(
+        client,
+        "_post_assignment",
+        side_effect=requests.exceptions.ReadTimeout("pending"),
+    )
+    sleep = mocker.patch("time.sleep")
+    notebook = uuid.uuid4()
+    with pytest.raises(requests.exceptions.ReadTimeout):
+        client.assign(notebook)
+    assert [call.args[:2] for call in post.call_args_list] == [
+        (notebook, str(i)) for i in range(4)
+    ]
+    assert [call.args[0] for call in sleep.call_args_list] == [10, 20, 40]
+
+
+@pytest.mark.parametrize("status", [400, 401, 403])
+def test_assign_does_not_retry_nontransient_errors(client, mocker, status):
+    get = mocker.patch.object(
+        client, "_get_assignment", return_value=pending_assignment()
+    )
+    post = mocker.patch.object(
+        client,
+        "_post_assignment",
+        side_effect=ColabRequestError(
+            "permanent", request=None, response=MagicMock(status_code=status)
+        ),
+    )
+    sleep = mocker.patch("time.sleep")
+    with pytest.raises(ColabRequestError):
+        client.assign(uuid.uuid4())
+    get.assert_called_once()
+    post.assert_called_once()
+    sleep.assert_not_called()
+
+
+def test_assign_succeeds_after_recovery_refreshes_token(client, mocker, monkeypatch):
+    monkeypatch.setenv("COLAB_CLI_ASSIGN_RETRIES", "1")
+    monkeypatch.setenv("COLAB_CLI_RETRY_BACKOFF", "0")
+    get = mocker.patch.object(
+        client,
+        "_get_assignment",
+        side_effect=[pending_assignment("first"), pending_assignment("fresh")],
+    )
+    result = PostAssignmentResponse(
+        accelerator="NONE",
+        endpoint="new",
+        variant=0,
+        runtimeProxyInfo={
+            "token": "proxy",
+            "tokenExpiresInSeconds": 3600,
+            "url": "http://backend",
+        },
+    )
+    post = mocker.patch.object(
+        client,
+        "_post_assignment",
+        side_effect=[requests.exceptions.ReadTimeout("pending"), result],
+    )
+    mocker.patch("time.sleep")
+    notebook = uuid.uuid4()
+    assert client.assign(notebook) is result
+    assert get.call_count == 2
+    assert [call.args[:2] for call in post.call_args_list] == [
+        (notebook, "first"),
+        (notebook, "fresh"),
+    ]
+
+
+def test_assign_retries_can_be_disabled(client, mocker, monkeypatch):
+    monkeypatch.setenv("COLAB_CLI_ASSIGN_RETRIES", "0")
+    get = mocker.patch.object(
+        client, "_get_assignment", return_value=pending_assignment()
+    )
+    post = mocker.patch.object(
+        client,
+        "_post_assignment",
+        side_effect=requests.exceptions.ReadTimeout("pending"),
+    )
+    sleep = mocker.patch("time.sleep")
+    with pytest.raises(requests.exceptions.ReadTimeout):
+        client.assign(uuid.uuid4())
+    get.assert_called_once()
+    post.assert_called_once()
+    sleep.assert_not_called()
 
 
 def test_client_assign_new(client, mock_session):
