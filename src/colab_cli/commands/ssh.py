@@ -583,6 +583,74 @@ def _install_rm_signal_handlers(do_rm: Callable[[], None]) -> None:
             pass  # e.g. not running in the main thread
 
 
+_SYNCHRONIZE = 0x00100000
+_INFINITE = 0xFFFFFFFF
+_WATCHDOG_CODE = (
+    "import sys; from colab_cli.commands.ssh import _rm_watchdog; "
+    "_rm_watchdog(int(sys.argv[1]), sys.argv[2:])"
+)
+
+
+def _spawn_rm_watchdog(name: str) -> None:
+    """Starts a detached process that stops ``name`` once we exit (Windows).
+
+    Win32-OpenSSH ends a ProxyCommand with TerminateProcess: no signal, no
+    ``finally``, no ``atexit``, so ``--rm`` teardown cannot run in this
+    process. A detached child survives that and does the teardown instead.
+
+    Args:
+      name: The session to stop.
+    """
+    # Global options precede the "ssh" subcommand; forward them so the
+    # watchdog uses the same session store and auth as this process.
+    args = sys.argv[1:]
+    global_args = args[: args.index("ssh")] if "ssh" in args else []
+    subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            _WATCHDOG_CODE,
+            str(os.getpid()),
+            *global_args,
+            "stop",
+            "-s",
+            name,
+        ],
+        creationflags=(
+            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        ),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+
+
+def _rm_watchdog(parent_pid: int, argv: list[str]) -> None:
+    """Waits for ``parent_pid`` to exit, then runs ``colab *argv``.
+
+    Entry point of the process started by ``_spawn_rm_watchdog``. If the
+    bridge already stopped the session, ``colab stop`` is a harmless no-op.
+
+    Args:
+      parent_pid: The ``--proxy-mode`` process to outlive.
+      argv: The ``colab`` arguments to run afterwards.
+    """
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    handle = kernel32.OpenProcess(_SYNCHRONIZE, False, parent_pid)
+    if handle:
+        kernel32.WaitForSingleObject(ctypes.c_void_p(handle), _INFINITE)
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+
+    from colab_cli import cli
+
+    sys.argv = ["colab", *argv]
+    cli.main()
+
+
 def _run_proxy_bridge(
     s: SessionState, identity: Optional[str], rm: bool
 ) -> int:
@@ -613,6 +681,8 @@ def _run_proxy_bridge(
 
     pubkey = _resolve_pubkey(identity)
     ws = _connect_websocket(_build_ws_url(s), pubkey)
+    if rm and os.name == "nt":
+        _spawn_rm_watchdog(s.name)
     try:
         return _bridge_proxy_mode(ws)
     finally:

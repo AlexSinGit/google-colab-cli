@@ -30,6 +30,8 @@ test_run.py enforces for `colab run`:
 * F. --rm teardown is idempotent across the signal path and the finally path.
 * G. --proxy-mode --rm stops a *reused* session too, not just an auto-created
   one.
+* H. on Windows, --rm teardown runs in a detached watchdog, since Win32-OpenSSH
+  kills the ProxyCommand with TerminateProcess (no signal, no finally).
 """
 
 from unittest.mock import MagicMock
@@ -284,3 +286,72 @@ def test_proxy_mode_rm_stops_reused_session(mock_common_state, mocker):
     result = runner.invoke(app, ["ssh", "--proxy-mode", "-s", "colab", "--rm"])
     assert result.exit_code == 0
     stop.assert_called_once_with(session="colab")
+
+
+# --- H. Windows --rm teardown survives TerminateProcess ------------------------
+
+
+@pytest.mark.parametrize(
+    ("os_name", "rm", "spawned"),
+    [("nt", True, True), ("nt", False, False), ("posix", True, False)],
+    ids=["windows-rm", "windows-no-rm", "posix-rm"],
+)
+def test_proxy_bridge_spawns_rm_watchdog_only_on_windows(
+    mocker, os_name, rm, spawned
+):
+    """Win32-OpenSSH kills the ProxyCommand outright, so --rm on Windows hands
+    teardown to a detached watchdog; POSIX keeps the signal/finally path."""
+    mocker.patch.object(ssh_module.os, "name", os_name)
+    mocker.patch.object(ssh_module, "_resolve_pubkey", return_value="pk")
+    mocker.patch.object(ssh_module, "_connect_websocket", return_value=MagicMock())
+    mocker.patch.object(ssh_module, "_bridge_proxy_mode", return_value=0)
+    mocker.patch.object(ssh_module, "_install_rm_signal_handlers")
+    mocker.patch.object(ssh_module, "_stop_session")
+    spawn = mocker.patch.object(ssh_module, "_spawn_rm_watchdog")
+
+    assert ssh_module._run_proxy_bridge(_make_session("ephem"), None, rm) == 0
+    if spawned:
+        spawn.assert_called_once_with("ephem")
+    else:
+        spawn.assert_not_called()
+
+
+def test_spawn_rm_watchdog_forwards_global_options(mocker):
+    """The watchdog runs `colab <global opts> stop -s NAME`, detached, so it
+    uses the same session store/auth and outlives the killed proxy."""
+    import subprocess
+
+    for flag, value in (("DETACHED_PROCESS", 0x8), ("CREATE_NEW_PROCESS_GROUP", 0x200)):
+        mocker.patch.object(subprocess, flag, value, create=True)
+    popen = mocker.patch("subprocess.Popen")
+    mocker.patch.object(
+        ssh_module.sys,
+        "argv",
+        ["colab", "--config", "s.json", "ssh", "--proxy-mode", "-s", "n", "--rm"],
+    )
+
+    ssh_module._spawn_rm_watchdog("n")
+
+    cmd = popen.call_args.args[0]
+    assert cmd[:3] == [ssh_module.sys.executable, "-c", ssh_module._WATCHDOG_CODE]
+    assert cmd[4:] == ["--config", "s.json", "stop", "-s", "n"]
+    assert popen.call_args.kwargs["creationflags"] == 0x8 | 0x200
+
+
+@pytest.mark.skipif(
+    ssh_module.os.name != "nt", reason="waits on a Windows process handle"
+)
+def test_rm_watchdog_runs_colab_after_parent_exits(mocker):
+    """The watchdog blocks until the parent exits, then runs the command."""
+    import subprocess
+    import sys
+
+    parent = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(1)"])
+    main = mocker.patch("colab_cli.cli.main")
+    mocker.patch.object(ssh_module.sys, "argv", ["python"])
+
+    ssh_module._rm_watchdog(parent.pid, ["stop", "-s", "n"])
+
+    assert parent.poll() is not None
+    main.assert_called_once_with()
+    assert ssh_module.sys.argv == ["colab", "stop", "-s", "n"]
