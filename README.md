@@ -7,7 +7,7 @@ Designed to support seamless developer productivity, headless automation, and AI
 [Demo](https://github.com/user-attachments/assets/656226a9-af13-4fdb-8eda-d7de747336a2)
 
 > [!NOTE]
-> **Platform support:** the Colab CLI currently supports **Linux and macOS** only. Windows is not supported at this time.
+> **Platform support:** the Colab CLI supports **Linux, macOS and Windows**. On Windows, `colab ssh` needs the built-in OpenSSH Client (`ssh` and `ssh-keygen` on `PATH`), `colab console` works best in Windows Terminal, and `colab update --install` is unavailable — upgrade with the printed `uv tool install -U` / `pip install -U` command instead.
 
 > [!TIP]
 > Looking for in-notebook, interactive agent-assisted coding instead of a terminal workflow? See the [Colab MCP Server](https://github.com/googlecolab/colab-mcp).

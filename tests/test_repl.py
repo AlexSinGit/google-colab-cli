@@ -14,6 +14,9 @@
 
 from unittest.mock import MagicMock, patch, ANY
 
+from prompt_toolkit.application import create_app_session
+from prompt_toolkit.input import create_pipe_input
+from prompt_toolkit.output import DummyOutput
 import pytest
 from typer.testing import CliRunner
 
@@ -21,6 +24,14 @@ from colab_cli.cli import app
 from colab_cli.repl import ColabREPL
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def headless_prompt_toolkit():
+    # PromptSession needs a real console on Windows; give it a dummy one.
+    with create_pipe_input() as pipe_input:
+        with create_app_session(input=pipe_input, output=DummyOutput()):
+            yield
 
 
 @pytest.fixture

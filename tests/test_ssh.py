@@ -22,6 +22,7 @@ vs --proxy-mode).
 """
 
 import io
+import os
 import shlex
 import subprocess
 import sys
@@ -36,6 +37,23 @@ from typer.testing import CliRunner
 import websocket
 
 runner = CliRunner()
+
+
+def _split_command_line(cmd: str) -> list[str]:
+    """Splits a command line the way the platform's ssh will run it."""
+    if os.name != "nt":
+        return shlex.split(cmd)
+    import ctypes
+    from ctypes import wintypes
+
+    shell32 = ctypes.WinDLL("shell32")
+    shell32.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
+    argc = ctypes.c_int()
+    argv = shell32.CommandLineToArgvW(cmd, ctypes.byref(argc))
+    try:
+        return [argv[i] for i in range(argc.value)]
+    finally:
+        ctypes.windll.kernel32.LocalFree(argv)
 
 
 def _make_session(
@@ -292,6 +310,9 @@ def test_bridge_proxy_mode_pumps_stdin_to_ws(mocker):
         "$(touch /tmp/pwned)",
         "a;rm -rf /",
         "ünïcode",
+        'q"uote',
+        "trail\\",
+        "100%h",
     ],
     ids=[
         "word",
@@ -301,6 +322,9 @@ def test_bridge_proxy_mode_pumps_stdin_to_ws(mocker):
         "cmd-substitution",
         "semicolon",
         "non-ascii",
+        "double-quote",
+        "trailing-backslash",
+        "ssh-percent-token",
     ],
 )
 @pytest.mark.parametrize(
@@ -309,12 +333,13 @@ def test_bridge_proxy_mode_pumps_stdin_to_ws(mocker):
 def test_proxy_command_round_trips_through_the_shell(name, identity):
     """The ProxyCommand string must re-parse into the exact argv.
 
-    `ssh` hands the ProxyCommand to /bin/sh, so every argument has to survive
-    word-splitting verbatim -- a hostile session name must arrive as one
-    literal argument, never as a new word or a substitution.
+    `ssh` hands the ProxyCommand to /bin/sh (CreateProcess on Windows), so
+    every argument has to survive word-splitting verbatim -- a hostile session
+    name must arrive as one literal argument, never as a new word or a
+    substitution. ssh first expands its own %-tokens, where "%%" is "%".
     """
     cmd = ssh_module._proxy_command(_make_session(name=name), identity)
-    argv = shlex.split(cmd)
+    argv = _split_command_line(cmd.replace("%%", "%"))
 
     assert argv[:7] == [
         sys.executable,
@@ -329,6 +354,12 @@ def test_proxy_command_round_trips_through_the_shell(name, identity):
         assert argv[7:] == ["--identity", identity]
     else:
         assert len(argv) == 7
+
+
+def test_ssh_base_args_discard_known_hosts():
+    """Host keys go to the platform null device (NUL on Windows)."""
+    args = ssh_module._ssh_base_args("proxy", None)
+    assert f"UserKnownHostsFile={os.devnull}" in args
 
 
 # --- session resolution ------------------------------------------------------

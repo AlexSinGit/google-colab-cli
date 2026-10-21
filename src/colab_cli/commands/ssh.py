@@ -405,7 +405,39 @@ def _proxy_command(session: SessionState, identity: Optional[str]) -> str:
     ]
     if identity:
         self_cmd.extend(["--identity", identity])
-    return shlex.join(self_cmd)
+    if os.name == "nt":
+        # Win32-OpenSSH hands ProxyCommand to CreateProcess, not a POSIX shell.
+        command = " ".join(_quote_windows_arg(arg) for arg in self_cmd)
+    else:
+        command = shlex.join(self_cmd)
+    # ssh expands %-tokens (%h, %p, ...) in ProxyCommand; "%%" is a literal %.
+    return command.replace("%", "%%")
+
+
+def _quote_windows_arg(arg: str) -> str:
+    """Quotes one argument for CreateProcess (MSVC ``argv`` rules).
+
+    Unlike ``subprocess.list2cmdline``, this also quotes a single quote:
+    ssh rejects an unbalanced ``'`` in an ``-o`` value as "invalid quotes",
+    while inside double quotes it is literal to both ssh and CreateProcess.
+    """
+    if arg and not any(c in arg for c in " \t\"'"):
+        return arg
+    quoted = ['"']
+    backslashes = 0
+    for c in arg:
+        if c == "\\":
+            backslashes += 1
+            continue
+        if c == '"':
+            # Escape the preceding backslashes and the quote itself.
+            quoted.append("\\" * (2 * backslashes + 1) + '"')
+        else:
+            quoted.append("\\" * backslashes + c)
+        backslashes = 0
+    # Backslashes before the closing quote must be doubled.
+    quoted.append("\\" * (2 * backslashes) + '"')
+    return "".join(quoted)
 
 
 def _ssh_base_args(proxy_command: str, identity: Optional[str]) -> list[str]:
@@ -417,7 +449,7 @@ def _ssh_base_args(proxy_command: str, identity: Optional[str]) -> list[str]:
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
-        "UserKnownHostsFile=/dev/null",
+        f"UserKnownHostsFile={os.devnull}",
         "-o",
         "LogLevel=ERROR",
     ]
@@ -542,7 +574,9 @@ def _install_rm_signal_handlers(do_rm: Callable[[], None]) -> None:
         do_rm()
         os._exit(0)
 
-    for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
+    # SIGHUP is POSIX-only; Windows delivers console close as SIGBREAK.
+    names = ("SIGHUP", "SIGBREAK", "SIGTERM", "SIGINT")
+    for sig in filter(None, (getattr(signal, n, None) for n in names)):
         try:
             signal.signal(sig, _on_signal)
         except (ValueError, OSError):

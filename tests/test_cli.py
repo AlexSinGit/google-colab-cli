@@ -32,6 +32,34 @@ from colab_cli.consumption import ConsumptionUserInfo
 runner = CliRunner()
 
 
+@pytest.mark.parametrize(
+    ("os_name", "isatty", "reconfigured"),
+    [("nt", False, True), ("nt", True, False), ("posix", False, False)],
+    ids=["windows-redirected", "windows-console", "posix"],
+)
+def test_force_utf8_stdio(os_name, isatty, reconfigured):
+    """Redirected Windows output is UTF-8 so non-ANSI text cannot crash it."""
+    import colab_cli.cli as cli_mod
+
+    stdout, stderr = MagicMock(), MagicMock()
+    for stream in (stdout, stderr):
+        stream.isatty.return_value = isatty
+    with (
+        patch.object(cli_mod.os, "name", os_name),
+        patch.object(cli_mod.sys, "stdout", stdout),
+        patch.object(cli_mod.sys, "stderr", stderr),
+    ):
+        cli_mod._force_utf8_stdio()
+
+    for stream in (stdout, stderr):
+        if reconfigured:
+            stream.reconfigure.assert_called_once_with(
+                encoding="utf-8", errors="replace"
+            )
+        else:
+            stream.reconfigure.assert_not_called()
+
+
 @pytest.fixture
 def mock_client(mock_common_state):
     return mock_common_state.client
@@ -393,13 +421,16 @@ def _extract_command_names(help_output: str) -> list[str]:
             continue
         if in_commands:
             stripped = line.strip()
-            if stripped.startswith("╰") or stripped.startswith("`"):
+            # Rich draws a square box ("└") on legacy Windows consoles.
+            if stripped.startswith(("╰", "└", "`")):
                 break
             # Lines look like:  "│ help        Show help for a command. │"
             # Strip the rich box characters.
-            inner = stripped.strip("│").strip()
-            if not inner:
+            inner = stripped.strip("│")
+            # A wrapped description continues on a line with no command name.
+            if not inner.strip() or inner.startswith("  "):
                 continue
+            inner = inner.strip()
             tok = inner.split()[0]
             names.append(tok)
     return names

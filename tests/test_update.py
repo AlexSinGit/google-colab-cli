@@ -163,6 +163,26 @@ def test_pypi_upgrade_uses_uv_hint(mocker, app_version, fake_settings, mock_pypi
     assert idx_install < idx_uv
 
 
+def test_pypi_upgrade_uses_uv_hint_windows(
+    mocker, app_version, fake_settings, mock_pypi
+):
+    """A uv tool install is detected from a backslash Windows path, and the
+    in-place upgrade stays disabled there."""
+    app_version("1.0.0")
+    mock_pypi({"info": {"version": "1.1.0"}})
+    fake_settings()
+    mocker.patch(
+        "sys.executable",
+        r"C:\Users\me\AppData\Roaming\uv\tools\google-colab-cli\Scripts\python.exe",
+    )
+    mocker.patch("colab_cli.auto_update.platform.system", return_value="Windows")
+
+    result = runner.invoke(app, ["update"])
+    assert result.exit_code == 0
+    assert "Run 'uv tool install -U google-colab-cli' to update." in result.output
+    assert "colab update --install" not in result.output
+
+
 def test_pypi_upgrade_uses_pip_hint_macos(
     mocker, app_version, fake_settings, mock_pypi
 ):

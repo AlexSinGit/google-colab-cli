@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import sys
 from typing import Optional
 
 import click
@@ -149,7 +150,24 @@ utility.register(app)
 usage.register(app)
 
 
+def _force_utf8_stdio():
+    """Makes redirected stdout/stderr UTF-8 on Windows.
+
+    A piped Windows stream defaults to the ANSI code page (e.g. cp1252), which
+    cannot encode rich's box-drawing characters and crashes the command.
+    """
+    if os.name != "nt":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure") and not stream.isatty():
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):
+                pass
+
+
 def main():
+    _force_utf8_stdio()
     app()
 
 

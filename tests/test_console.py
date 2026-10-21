@@ -23,6 +23,7 @@ except ImportError:
     # Windows has no termios; tests requiring raw-terminal mode are skipped.
     termios = None  # type: ignore
 
+import colab_cli.console as console_mod
 from colab_cli.console import connect_console, on_message, on_open
 from colab_cli.state import SessionState
 import pytest
@@ -30,6 +31,16 @@ import pytest
 needs_termios = pytest.mark.skipif(
     termios is None, reason="requires termios (POSIX only)"
 )
+
+
+@pytest.fixture(autouse=True)
+def no_msvcrt():
+    """Runs tests on the POSIX/piped path unless they opt into msvcrt.
+
+    On Windows the real msvcrt would otherwise block reading the console.
+    """
+    with patch.object(console_mod, "msvcrt", None):
+        yield
 
 
 @pytest.fixture
@@ -259,3 +270,110 @@ def test_console_no_termios_degrades_gracefully(
         connect_console(mock_session)
 
     mock_ws_instance.run_forever.assert_called_once()
+
+
+class _SyncThread:
+    """Runs a thread target inline so the read loop can be asserted on."""
+
+    def __init__(self, target, daemon=None):
+        self.target = target
+
+    def start(self):
+        self.target()
+
+
+@pytest.mark.parametrize(
+    ("keys", "expected"),
+    [
+        (["a"], "a"),
+        (["\r"], "\r"),
+        (["\x03"], "\x03"),
+        (["\x08"], "\x7f"),
+        (["\xe0", "H"], "\x1b[A"),
+        (["\xe0", "K"], "\x1b[D"),
+        (["\x00", ";"], "\x1bOP"),
+        (["\xe0", "s"], ""),
+    ],
+    ids=["char", "enter", "ctrl-c", "backspace", "up", "left", "f1", "unmapped"],
+)
+def test_read_windows_key_translates_to_xterm(keys, expected):
+    """Windows scan codes become the xterm sequences the remote tmux expects."""
+    fake_msvcrt = MagicMock()
+    fake_msvcrt.getwch.side_effect = keys
+    with patch.object(console_mod, "msvcrt", fake_msvcrt):
+        assert console_mod.read_windows_key() == expected
+
+
+@patch("colab_cli.console.os.get_terminal_size")
+@patch("colab_cli.console.sys.stdin.isatty")
+def test_read_stdin_windows_tty_sends_keys(mock_isatty, mock_get_term_size):
+    """A Windows console TTY reads keypresses via msvcrt, not sys.stdin."""
+    mock_isatty.return_value = True
+    mock_get_term_size.return_value = os.terminal_size((80, 24))
+    fake_msvcrt = MagicMock()
+    # Ctrl-Z must be forwarded, not treated as EOF; the error ends the loop.
+    fake_msvcrt.getwch.side_effect = ["l", "\x1a", "\xe0", "H", OSError()]
+    mock_ws = MagicMock()
+
+    console_mod._is_running = True
+    with (
+        patch.object(console_mod, "msvcrt", fake_msvcrt),
+        patch("colab_cli.console.threading.Thread", _SyncThread),
+    ):
+        on_open(mock_ws)
+
+    sent = [json.loads(c.args[0]) for c in mock_ws.send.call_args_list]
+    assert sent[1:] == [{"data": "l"}, {"data": "\x1a"}, {"data": "\x1b[A"}]
+
+
+@patch("colab_cli.console.websocket.WebSocketApp")
+@patch("colab_cli.console.sys.stdin.isatty")
+def test_console_windows_sets_and_restores_console_mode(
+    mock_isatty, mock_ws_app, mock_session
+):
+    """On a Windows TTY the console mode is changed, then always restored."""
+    mock_isatty.return_value = True
+    mock_ws_app.return_value.run_forever.side_effect = RuntimeError("boom")
+    restore = MagicMock()
+
+    with (
+        patch.object(console_mod, "termios", None),
+        patch.object(console_mod, "tty", None),
+        patch.object(console_mod, "msvcrt", MagicMock()),
+        patch.object(
+            console_mod, "enable_windows_console_mode", return_value=restore
+        ) as enable,
+        patch("colab_cli.console.threading.Thread") as thread,
+        pytest.raises(RuntimeError),
+    ):
+        connect_console(mock_session)
+
+    enable.assert_called_once()
+    restore.assert_called_once()
+    assert thread.call_args.kwargs["target"] is console_mod.watch_terminal_size
+
+
+@patch("colab_cli.console.send_terminal_size")
+@patch("colab_cli.console.os.get_terminal_size")
+def test_watch_terminal_size_sends_only_on_change(mock_get_size, mock_send):
+    """The resize poller (Windows has no SIGWINCH) reports changes only."""
+    mock_get_size.side_effect = [
+        os.terminal_size((80, 24)),
+        os.terminal_size((80, 24)),
+        os.terminal_size((120, 40)),
+    ]
+    stop = MagicMock()
+    stop.wait.side_effect = [False, False, True]
+    ws = MagicMock()
+
+    console_mod._is_running = True
+    console_mod.watch_terminal_size(ws, stop)
+
+    mock_send.assert_called_once_with(ws)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows console API only")
+def test_enable_windows_console_mode_returns_restore():
+    """Without an attached console this is a safe no-op, never a crash."""
+    restore = console_mod.enable_windows_console_mode()
+    restore()
